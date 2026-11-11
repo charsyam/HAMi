@@ -599,19 +599,17 @@ func (dev *RemoteGPUDevices) Fit(devices []*device.DeviceUsage, request device.C
 }
 
 // ValidateReservedServer verifies that a reserved RemoteGPU allocation still
-// belongs to a server selected by the Pod. Bind calls this after Filter has
-// recorded the allocation, before Kubernetes commits the Pod to its node.
+// belongs to a server the pool serves and, when the Pod has a selector, one it
+// selects. Bind calls this after Filter has recorded the allocation, before
+// Kubernetes commits the Pod to its node.
 func (dev *RemoteGPUDevices) ValidateReservedServer(pod *corev1.Pod, allocated device.PodDevices) error {
 	selector, err := lupineServerSelector(pod)
 	if err != nil {
 		return err
 	}
-	if selector == nil {
-		return nil
-	}
 	server, _ := committedAllocation(&allocated)
 	if server == "" {
-		if PodRequestsRemoteGPU(pod) {
+		if selector != nil && PodRequestsRemoteGPU(pod) {
 			return fmt.Errorf("no Lupine server is reserved for RemoteGPU pod")
 		}
 		return nil
@@ -623,6 +621,15 @@ func (dev *RemoteGPUDevices) ValidateReservedServer(pod *corev1.Pod, allocated d
 	dev.pool.mu.Unlock()
 	if cold {
 		dev.pool.refresh(context.Background())
+	}
+	// The server can leave the pool between Filter and Bind. Its endpoint may
+	// then be missing from the pod's annotations, and in any case points at a
+	// server that no longer accepts new work, so the pod is placed again.
+	if _, ok := dev.pool.endpoint(server); !ok {
+		return fmt.Errorf("reserved Lupine server %q is no longer available", server)
+	}
+	if selector == nil {
+		return nil
 	}
 	if len(dev.pool.matchingServers(selector, []string{server})) == 0 {
 		return fmt.Errorf("reserved Lupine server %q no longer matches %s", server, LupineServerSelectorAnno)
@@ -797,6 +804,15 @@ func (dev *RemoteGPUDevices) tryFit(byServer map[string][]*device.DeviceUsage, s
 	}
 	candidates := make([]candidate, 0, len(servers))
 	for _, server := range servers {
+		// The cards come from the scheduler's node cache, which register only
+		// rewrites on its next pass; the pool may have dropped the server since,
+		// for example after a forced refresh found it NotReady. PatchAnnotations
+		// resolves the client's endpoint from the pool, so a server it no longer
+		// carries would bind the pod with an empty LUPINE_SERVER.
+		if _, ok := dev.pool.endpoint(server); !ok {
+			reason[common.CardNotHealth] += len(byServer[server])
+			continue
+		}
 		c := candidate{server: server}
 		taken := false
 		for _, d := range byServer[server] {

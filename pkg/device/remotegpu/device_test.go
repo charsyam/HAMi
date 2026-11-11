@@ -18,6 +18,8 @@ package remotegpu
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,6 +64,19 @@ func request(nums, mem int64) device.ContainerDeviceRequest {
 	}
 }
 
+// servedDevices returns a backend whose pool serves the named servers, as it
+// does in the scheduler once register has refreshed the pool. Fit only hands
+// out cards from servers the pool still carries an endpoint for.
+func servedDevices(servers ...string) *RemoteGPUDevices {
+	dev := InitRemoteGPUDevice(testConfig())
+	dev.pool.mu.Lock()
+	defer dev.pool.mu.Unlock()
+	for i, server := range servers {
+		dev.pool.endpoints[server] = fmt.Sprintf("10.0.0.%d:%d", i+1, DefaultLupinePort)
+	}
+	return dev
+}
+
 func setServerLabels(dev *RemoteGPUDevices, byServer map[string]map[string]string) {
 	dev.pool.mu.Lock()
 	defer dev.pool.mu.Unlock()
@@ -85,7 +100,7 @@ func requestingContainer(name string, nums, mem int64) corev1.Container {
 }
 
 func TestFit_ConfinesAllocationToOneServer(t *testing.T) {
-	dev := InitRemoteGPUDevice(testConfig())
+	dev := servedDevices("gpu-a", "gpu-b")
 	// Two servers with one free card each: the fleet has two cards free, but a
 	// two-card request must not be split across them.
 	devices := []*device.DeviceUsage{
@@ -108,7 +123,7 @@ func TestFit_ConfinesAllocationToOneServer(t *testing.T) {
 }
 
 func TestFit_ServerPoolSelectorFiltersCandidates(t *testing.T) {
-	dev := InitRemoteGPUDevice(testConfig())
+	dev := servedDevices("gpu-a", "gpu-b")
 	setServerLabels(dev, map[string]map[string]string{
 		"gpu-a": {"gpu-pool": "training"},
 		"gpu-b": {"gpu-pool": "inference"},
@@ -199,8 +214,65 @@ func TestValidateReservedServer_ColdPool(t *testing.T) {
 	assert.NilError(t, dev.ValidateReservedServer(pod, allocated))
 }
 
-func TestFit_MultiContainerStaysOnSelectedServer(t *testing.T) {
+// The node cache that Fit reads is rewritten only on register's next pass, so
+// it can still list a server that a refresh has already dropped from the pool.
+// Allocating from it would bind the pod with no endpoint for LUPINE_SERVER.
+func TestFit_SkipsServerThePoolNoLongerServes(t *testing.T) {
+	nodes := []corev1.Node{
+		lupineNode("gpu-a", "10.0.0.5", "", []*device.DeviceInfo{gpu("GPU-a", 40000)}),
+		lupineNode("gpu-b", "10.0.0.6", "", []*device.DeviceInfo{gpu("GPU-b1", 40000), gpu("GPU-b2", 40000)}),
+	}
+	stubFleet(t, nodes, nil, nil)
 	dev := InitRemoteGPUDevice(testConfig())
+	dev.pool.snapshot(context.Background())
+	// The node cache as register left it: both servers, every card free.
+	cached := []*device.DeviceUsage{
+		card("gpu-a", "GPU-a", 40000),
+		card("gpu-b", "GPU-b1", 40000),
+		card("gpu-b", "GPU-b2", 40000),
+	}
+
+	// gpu-a, the smallest server and so the first choice, goes NotReady and a
+	// refresh drops it before register rewrites the cache.
+	setNodeReady(&nodes[0], corev1.ConditionFalse)
+	dev.pool.fetchedAt = dev.pool.fetchedAt.Add(-poolTTL)
+	dev.pool.snapshot(context.Background())
+
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "pod-1"}}
+	fit, allocated, _ := dev.Fit(cached, request(1, 0), pod, nil, nil)
+	assert.Equal(t, fit, true)
+	for _, d := range allocated[RemoteGPUCommonWord] {
+		assert.Equal(t, serverOf(d.UUID), "gpu-b", "must not allocate from the dropped server")
+	}
+	annos := map[string]string{}
+	dev.PatchAnnotations(pod, &annos, device.PodDevices{RemoteGPUCommonWord: device.PodSingleDevice{allocated[RemoteGPUCommonWord]}})
+	assert.Equal(t, annos[LupineServerAnno], "10.0.0.6:14833")
+
+	// With only the dropped server left, the pod is refused instead.
+	fit, _, reason := dev.Fit(cached[:1], request(1, 0), pod, nil, nil)
+	assert.Equal(t, fit, false)
+	assert.Assert(t, strings.Contains(reason, common.CardNotHealth), reason)
+}
+
+func TestValidateReservedServer_RejectsServerThePoolDropped(t *testing.T) {
+	dev := servedDevices("gpu-b")
+	pod := &corev1.Pod{}
+	reserved := func(server string) device.PodDevices {
+		return device.PodDevices{RemoteGPUCommonWord: device.PodSingleDevice{
+			device.ContainerDevices{{UUID: deviceID(server, "GPU-1"), Type: RemoteGPUCommonWord}},
+		}}
+	}
+
+	// No selector is needed: an allocation on a server the pool no longer
+	// serves has no endpoint to give the client.
+	assert.ErrorContains(t, dev.ValidateReservedServer(pod, reserved("gpu-a")), "reserved Lupine server \"gpu-a\" is no longer available")
+	assert.NilError(t, dev.ValidateReservedServer(pod, reserved("gpu-b")))
+	// A pod with no RemoteGPU allocation is not this backend's to judge.
+	assert.NilError(t, dev.ValidateReservedServer(pod, device.PodDevices{}))
+}
+
+func TestFit_MultiContainerStaysOnSelectedServer(t *testing.T) {
+	dev := servedDevices("gpu-a", "gpu-b")
 	devices := []*device.DeviceUsage{
 		card("gpu-a", "GPU-small", 1000),
 		card("gpu-b", "GPU-1", 40000),
@@ -255,7 +327,7 @@ func TestFit_SelectsServerForEveryContainerRequest(t *testing.T) {
 
 	for _, tt := range orders {
 		t.Run(tt.name, func(t *testing.T) {
-			dev := InitRemoteGPUDevice(testConfig())
+			dev := servedDevices("gpu-a", "gpu-b")
 			devices := []*device.DeviceUsage{
 				card("gpu-a", "GPU-1", 40000),
 				card("gpu-b", "GPU-2", 80000),
@@ -276,7 +348,7 @@ func TestFit_SelectsServerForEveryContainerRequest(t *testing.T) {
 // Combining the largest count and memory into one synthetic request would
 // require two 60000 MB cards and reject this valid per-container placement.
 func TestFit_ChecksCardCountAndMemoryPerContainer(t *testing.T) {
-	dev := InitRemoteGPUDevice(testConfig())
+	dev := servedDevices("gpu-a")
 	devices := []*device.DeviceUsage{
 		card("gpu-a", "GPU-large", 80000),
 		card("gpu-a", "GPU-small", 40000),
@@ -296,7 +368,7 @@ func TestFit_ChecksCardCountAndMemoryPerContainer(t *testing.T) {
 }
 
 func TestFit_FailureReasonsCountCardsAndServers(t *testing.T) {
-	dev := InitRemoteGPUDevice(testConfig())
+	dev := servedDevices("gpu-a", "gpu-b")
 	devices := []*device.DeviceUsage{
 		card("gpu-a", "GPU-a1", 40000),
 		card("gpu-a", "GPU-a2", 40000),
@@ -311,7 +383,7 @@ func TestFit_FailureReasonsCountCardsAndServers(t *testing.T) {
 }
 
 func TestFit_FailureReasonsCountFreeSmallCardsOnTakenServer(t *testing.T) {
-	dev := InitRemoteGPUDevice(testConfig())
+	dev := servedDevices("gpu-a", "gpu-b")
 	occupied := card("gpu-a", "GPU-a1", 80000)
 	occupied.Used = 1
 	devices := []*device.DeviceUsage{
@@ -329,7 +401,7 @@ func TestFit_FailureReasonsCountFreeSmallCardsOnTakenServer(t *testing.T) {
 }
 
 func TestFit_MultiContainerRejectsOtherServerFallback(t *testing.T) {
-	dev := InitRemoteGPUDevice(testConfig())
+	dev := servedDevices("gpu-a", "gpu-b")
 	devices := []*device.DeviceUsage{
 		card("gpu-a", "GPU-1", 40000),
 		card("gpu-b", "GPU-2", 80000),
@@ -352,7 +424,7 @@ func TestFit_MultiContainerRejectsOtherServerFallback(t *testing.T) {
 }
 
 func TestFit_AllocatesWholeCard(t *testing.T) {
-	dev := InitRemoteGPUDevice(testConfig())
+	dev := servedDevices("gpu-a")
 	devices := []*device.DeviceUsage{card("gpu-a", "GPU-1", 40000)}
 
 	// A 2000MB request still consumes the entire card.
@@ -380,7 +452,7 @@ func TestFit_RejectsUnfitCards(t *testing.T) {
 // A card booked by a pod that landed on a different client node is invisible to
 // this node's usage view, so Fit must consult the cluster-wide reservation set.
 func TestFit_HonorsClusterWideReservation(t *testing.T) {
-	dev := InitRemoteGPUDevice(testConfig())
+	dev := servedDevices("gpu-a")
 	free := card("gpu-a", "GPU-1", 40000)
 
 	fit, _, _ := dev.Fit([]*device.DeviceUsage{free}, request(1, 0), &corev1.Pod{}, nil, nil)
@@ -617,7 +689,7 @@ func TestMutateAdmission_LeavesSelectorValidationToWebhook(t *testing.T) {
 }
 
 func TestValidateReservedServer(t *testing.T) {
-	dev := InitRemoteGPUDevice(testConfig())
+	dev := servedDevices("gpu-a")
 	setServerLabels(dev, map[string]map[string]string{
 		"gpu-a": {"gpu-pool": "inference"},
 	})
@@ -813,7 +885,7 @@ func TestMutateAdmission_SkipsEnforcementWhenNotAsked(t *testing.T) {
 // server is taken whole. Leaving a card behind would leave it visible to this
 // pod and free for the next one, which is how two pods end up on one card.
 func TestFit_TakesTheWholeServer(t *testing.T) {
-	dev := InitRemoteGPUDevice(testConfig())
+	dev := servedDevices("gpu-a")
 	devices := []*device.DeviceUsage{
 		card("gpu-a", "GPU-A1", 40000),
 		card("gpu-a", "GPU-A2", 40000),
@@ -829,7 +901,7 @@ func TestFit_TakesTheWholeServer(t *testing.T) {
 // Whole servers are the unit, so the smallest one that can serve the request
 // leaves the deeper servers for requests that need them.
 func TestFit_PrefersTheSmallestSufficientServer(t *testing.T) {
-	dev := InitRemoteGPUDevice(testConfig())
+	dev := servedDevices("gpu-a", "gpu-b")
 	// gpu-a sorts first and is the larger of the two.
 	devices := []*device.DeviceUsage{
 		card("gpu-a", "GPU-A1", 40000),
@@ -852,7 +924,7 @@ func TestFit_PrefersTheSmallestSufficientServer(t *testing.T) {
 // A single card in use takes its whole server out of the running, because the
 // pod holding it can already see the rest.
 func TestFit_OneBusyCardWithholdsItsServer(t *testing.T) {
-	dev := InitRemoteGPUDevice(testConfig())
+	dev := servedDevices("gpu-a", "gpu-b")
 	busy := card("gpu-a", "GPU-A1", 40000)
 	busy.Used = 1
 	devices := []*device.DeviceUsage{
@@ -875,7 +947,7 @@ func TestFit_OneBusyCardWithholdsItsServer(t *testing.T) {
 // Cards too small for the request do not count towards it, but they still come
 // with the server, since the client can see them either way.
 func TestFit_CountsOnlyCardsThatMeetTheRequest(t *testing.T) {
-	dev := InitRemoteGPUDevice(testConfig())
+	dev := servedDevices("gpu-a")
 	devices := []*device.DeviceUsage{
 		card("gpu-a", "GPU-A1", 40000),
 		card("gpu-a", "GPU-A2", 1000),
