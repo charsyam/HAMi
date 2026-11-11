@@ -644,6 +644,32 @@ func TestMutateAdmission_IgnoresContainerWithoutRequest(t *testing.T) {
 	assert.Equal(t, len(ctr.Env), 0)
 }
 
+func TestMutateAdmission_IgnoresZeroCountRequest(t *testing.T) {
+	prev := RemoteGPUClientImage
+	t.Cleanup(func() { RemoteGPUClientImage = prev })
+	cfg := testConfig()
+	cfg.ClientImage = "lupine-client:test"
+	dev := InitRemoteGPUDevice(cfg)
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+		Name: "app",
+		Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+			corev1.ResourceName(RemoteGPUResourceCount):  resource.MustParse("0"),
+			corev1.ResourceName(RemoteGPUResourceMemory): resource.MustParse("1024"),
+		}},
+	}}}}
+
+	found, err := dev.MutateAdmission(&pod.Spec.Containers[0], pod)
+	FinalizeAdmission(pod)
+	assert.NilError(t, err)
+	assert.Equal(t, found, false)
+	assert.Equal(t, len(pod.Spec.Containers[0].Env), 0)
+	assert.Equal(t, len(pod.Spec.Containers[0].VolumeMounts), 0)
+	assert.Equal(t, len(pod.Spec.InitContainers), 0)
+	assert.Equal(t, len(pod.Spec.Volumes), 0)
+	_, labelled := pod.Labels[RemoteGPUPodLabel]
+	assert.Equal(t, labelled, false)
+}
+
 func TestPodRequestsRemoteGPURequiresPositiveCount(t *testing.T) {
 	tests := []struct {
 		name string

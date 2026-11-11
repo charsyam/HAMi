@@ -206,7 +206,11 @@ func (dev *RemoteGPUDevices) MutateAdmission(ctr *corev1.Container, pod *corev1.
 			}
 		}
 	}
-	if _, ok := resourceValue(ctr, RemoteGPUResourceCount); !ok {
+	// An explicit zero asks for no card, as in GenerateResourceRequests and
+	// PodRequestsRemoteGPU. Arming it would deliver client libraries, point
+	// LUPINE_SERVER at an endpoint the scheduler never writes, and mark the
+	// pod for the remote GPU monitor.
+	if count, ok := resourceValue(ctr, RemoteGPUResourceCount); !ok || count <= 0 {
 		return false, nil
 	}
 	if err := armClientLibraries(ctr, pod); err != nil {
